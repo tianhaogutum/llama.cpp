@@ -1,5 +1,6 @@
 #include "jinja/string.h"
 #include "jinja/value.h"
+#include "unicode.h"
 
 #include <algorithm>
 #include <functional>
@@ -206,50 +207,68 @@ string string::titlecase() {
     });
 }
 string string::strip(bool left, bool right, std::optional<const std::string_view> chars) {
-    static auto strip_part = [](const std::string & s, bool left, bool right, std::optional<const std::string_view> chars) -> std::string {
-        size_t start = 0;
-        size_t end = s.length();
-        auto match_char = [&chars](unsigned char c) -> bool {
-            return chars ? (*chars).find(c) != std::string::npos : isspace(c);
-        };
-        if (left) {
-            while (start < end && match_char(static_cast<unsigned char>(s[start]))) {
-                ++start;
-            }
-        }
-        if (right) {
-            while (end > start && match_char(static_cast<unsigned char>(s[end - 1]))) {
-                --end;
-            }
-        }
-        return s.substr(start, end - start);
-    };
-    if (parts.empty()) {
+    if (parts.empty() || (!left && !right)) {
         return *this;
     }
+    // Python str.strip() whitespace, including the four ASCII information separators.
+    static constexpr std::string_view whitespace =
+        "\t\n\v\f\r\x1c\x1d\x1e\x1f \u0085\u00a0\u1680"
+        "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+        "\u2028\u2029\u202f\u205f\u3000";
+    const auto strip_chars = chars.value_or(whitespace);
+    // A UTF-8 character can span parts after slicing and concatenation.
+    const std::string combined = parts.size() == 1 ? std::string() : str();
+    const std::string_view text = parts.size() == 1 ? std::string_view(parts[0].val) : std::string_view(combined);
+    size_t start = 0;
+    size_t end = text.size();
+    auto match_length = [&strip_chars](std::string_view text) -> size_t {
+        const auto parsed = common_parse_utf8_codepoint(text, 0);
+        if (parsed.status != utf8_parse_result::SUCCESS ||
+            strip_chars.find(text.substr(0, parsed.bytes_consumed)) == std::string_view::npos) {
+            return 0;
+        }
+        return parsed.bytes_consumed;
+    };
     if (left) {
-        for (size_t i = 0; i < parts.size(); ++i) {
-            parts[i].val = strip_part(parts[i].val, true, false, chars);
-            if (parts[i].val.empty()) {
-                // remove empty part
-                parts.erase(parts.begin() + i);
-                --i;
-                continue;
-            } else {
+        while (start < end) {
+            const size_t len = match_length(text.substr(start, end - start));
+            if (!len) {
                 break;
             }
+            start += len;
         }
     }
     if (right) {
-        for (size_t i = parts.size(); i-- > 0;) {
-            parts[i].val = strip_part(parts[i].val, false, true, chars);
-            if (parts[i].val.empty()) {
-                // remove empty part
-                parts.erase(parts.begin() + i);
-                continue;
-            } else {
+        while (end > start) {
+            size_t pos = end - 1;
+            while (pos > start && end - pos < 4 && (static_cast<unsigned char>(text[pos]) & 0xc0) == 0x80) {
+                --pos;
+            }
+            if (match_length(text.substr(pos, end - pos)) != end - pos) {
                 break;
             }
+            end = pos;
+        }
+    }
+    size_t remove_right = text.size() - end;
+    if (left) {
+        size_t first = 0;
+        while (first < parts.size() && parts[first].val.size() <= start) {
+            start -= parts[first].val.size();
+            ++first;
+        }
+        parts.erase(parts.begin(), parts.begin() + first);
+        if (!parts.empty() && start) {
+            parts.front().val.erase(0, start);
+        }
+    }
+    if (right) {
+        while (!parts.empty() && parts.back().val.size() <= remove_right) {
+            remove_right -= parts.back().val.size();
+            parts.pop_back();
+        }
+        if (!parts.empty() && remove_right) {
+            parts.back().val.resize(parts.back().val.size() - remove_right);
         }
     }
     return *this;

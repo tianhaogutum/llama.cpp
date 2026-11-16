@@ -37,6 +37,7 @@ static void test_macros(testing & t);
 static void test_namespace(testing & t);
 static void test_tests(testing & t);
 static void test_string_methods(testing & t);
+static void test_unicode_stripping(testing & t);
 static void test_array_methods(testing & t);
 static void test_object_methods(testing & t);
 static void test_hasher(testing & t);
@@ -100,6 +101,7 @@ int main(int argc, char *argv[]) {
     t.test("namespace", test_namespace);
     t.test("tests", test_tests);
     t.test("string methods", test_string_methods);
+    t.test("unicode stripping", test_unicode_stripping);
     t.test("array methods", test_array_methods);
     t.test("object methods", test_object_methods);
     t.test("tts norm patterns", test_tts_norm_patterns);
@@ -154,7 +156,98 @@ static void test_shared_render(testing & t) {
             t.assert_true("request-local state", worker.get());
         }
     });
+}
 
+static void test_unicode_stripping(testing & t) {
+    const std::vector<std::string> whitespace = {
+        "\t", "\n", "\v", "\f", "\r", "\x1c", "\x1d", "\x1e", "\x1f", " ",
+        "\u0085", "\u00a0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004",
+        "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029",
+        "\u202f", "\u205f", "\u3000",
+    };
+    for (size_t i = 0; i < whitespace.size(); ++i) {
+        const auto & ws = whitespace[i];
+        test_template(t, "whitespace " + std::to_string(i),
+            "[{{ s|trim }}]|[{{ s.strip() }}]|[{{ s.lstrip() }}]|[{{ s.rstrip() }}]",
+            {{"s", ws + "text" + ws}},
+            "[text]|[text]|[text" + ws + "]|[" + ws + "text]"
+        );
+    }
+    test_template(t, "non-whitespace is preserved",
+        "{{ s|trim }}",
+        {{"s", "\u180e\u200b\ufefftext\ufeff\u200b\u180e"}},
+        "\u180e\u200b\ufefftext\ufeff\u200b\u180e"
+    );
+    test_template(t, "trim unicode chars",
+        "{{ s|trim(chars) }}|{{ s.strip(chars) }}|{{ s.lstrip(chars) }}|{{ s.rstrip(chars) }}",
+        {{"s", "\u3000\u00a0text\u00a0\u3000"}, {"chars", "\u00a0\u3000"}},
+        "text|text|text\u00a0\u3000|\u3000\u00a0text"
+    );
+    test_template(t, "trim chars sharing utf8 bytes",
+        "{{ s|trim(chars) }}",
+        {{"s", "\u3001text\u3002"}, {"chars", "\u3000"}},
+        "\u3001text\u3002"
+    );
+    test_template(t, "trim empty chars preserves whitespace",
+        "{{ s|trim('') }}",
+        {{"s", " \u3000text\u3000 "}},
+        " \u3000text\u3000 "
+    );
+    test_template(t, "trim all whitespace",
+        "[{{ s|trim }}]",
+        {{"s", " \u3000\u00a0\t"}},
+        "[]"
+    );
+    test_template(t, "trim concatenated parts",
+        "{{ ('\u3000' + s + '\u00a0')|trim }}",
+        {{"s", " \u2009text\u2009 "}},
+        "text"
+    );
+    test_template(t, "trim empty string",
+        "[{{ s|trim }}]|[{{ s.strip() }}]|[{{ s.lstrip() }}]|[{{ s.rstrip() }}]",
+        {{"s", ""}},
+        "[]|[]|[]|[]"
+    );
+    test_template(t, "trim supplementary chars",
+        "{{ s|trim(chars) }}|{{ s.lstrip(chars) }}|{{ s.rstrip(chars) }}",
+        {{"s", "\U0001f600text\U0001f600"}, {"chars", "\U0001f600"}},
+        "text|text\U0001f600|\U0001f600text"
+    );
+    test_template(t, "trim preserves supplementary chars with shared prefix",
+        "{{ s|trim(chars) }}",
+        {{"s", "\U0001f601text\U0001f601"}, {"chars", "\U0001f600"}},
+        "\U0001f601text\U0001f601"
+    );
+    test_template(t, "trim explicit none",
+        "{{ s|trim(none) }}|{{ s.strip(none) }}|{{ s.lstrip(none) }}|{{ s.rstrip(none) }}|{{ s|trim(chars=none) }}",
+        {{"s", "\u3000text\u00a0"}},
+        "text|text|text\u00a0|\u3000text|text"
+    );
+    test_template(t, "trim ascii chars preserves unicode whitespace",
+        "{{ s|trim(' ') }}",
+        {{"s", " \u3000text\u3000 "}},
+        "\u3000text\u3000"
+    );
+    test_template(t, "trim split utf8 characters",
+        "{{ (s[:1] + s[1:])|trim }}|{{ (s[:-1] + s[-1:])|trim }}",
+        {{"s", "\u3000text\u3000"}},
+        "text|text"
+    );
+    test_template(t, "trim preserves internal line endings",
+        "{{ s|trim }}",
+        {{"s", "\r\ntext\r\nmore\rtext\r\n"}},
+        "text\r\nmore\rtext"
+    );
+    test_template(t, "trim decomposed characters independently",
+        "{{ s|trim(chars) }}",
+        {{"s", "e\u0301text\u0301e"}, {"chars", "e\u0301"}},
+        "text"
+    );
+    test_template(t, "trim explicit nul",
+        "{{ s|trim(chars) }}",
+        {{"s", std::string("\0text\0", 6)}, {"chars", std::string("\0", 1)}},
+        "text"
+    );
 }
 
 static void test_whitespace_control(testing & t) {
@@ -2893,6 +2986,56 @@ static void test_caps(testing & t) {
 }
 
 static void test_string_parts(testing & t) {
+    t.test("strip handles split codepoints without changing input marking", [](testing & t) {
+        jinja::string str;
+        str.parts = {{false, "\xe3"}, {true, "\x80\x80text\xe3\x80"}, {false, "\x80"}};
+        str.strip(true, true);
+        if (t.assert_true("one part remains", str.parts.size() == 1)) {
+            t.assert_true("retained bytes keep their input flag", str.parts[0].is_input);
+            t.assert_true("both split codepoints removed", str.parts[0].val == "text");
+        }
+    });
+    t.test("strip keeps internal parts and their input marking", [](testing & t) {
+        jinja::string str;
+        str.parts = {{false, "\u3000prefix:"}, {true, "\u00a0text\u00a0"}, {false, ":suffix\u2009"}};
+        str.strip(true, true);
+        if (t.assert_true("all content parts remain", str.parts.size() == 3)) {
+            t.assert_true("template prefix is trimmed", !str.parts[0].is_input && str.parts[0].val == "prefix:");
+            t.assert_true("internal whitespace and input flag are preserved", str.parts[1].is_input && str.parts[1].val == "\u00a0text\u00a0");
+            t.assert_true("template suffix is trimmed", !str.parts[2].is_input && str.parts[2].val == ":suffix");
+        }
+    });
+    t.test("rstrip does not accept a partial codepoint match", [](testing & t) {
+        jinja::string str("text\xc2\xa0\x80");
+        str.strip(false, true);
+        t.assert_true("invalid suffix is preserved", str.str() == "text\xc2\xa0\x80");
+    });
+    t.test("strip rejects invalid utf8 even in an explicit character set", [](testing & t) {
+        jinja::string str("\xff");
+        str.strip(true, true, "\xff");
+        t.assert_true("invalid byte is preserved", str.str() == "\xff");
+    });
+    t.test("rstrip lone continuation byte", [](testing & t) {
+        jinja::string str("\x80");
+        str.strip(false, true);
+        t.assert_true("continuation byte is preserved", str.str() == "\x80");
+    });
+    t.test("unicode strip preserves input marking", [](testing & t) {
+        jinja::string str;
+        str.parts = {{false, "\u3000"}, {true, "\u00a0text\u2009"}, {false, "\u3000"}};
+        str.strip(true, true);
+        if (t.assert_true("only the input part remains", str.parts.size() == 1)) {
+            t.assert_true("input marking is preserved", str.parts[0].is_input);
+            t.assert_true("content is preserved", str.parts[0].val == "text");
+        }
+    });
+    t.test("strip preserves incomplete utf8", [](testing & t) {
+        for (const auto & text : {std::string("\xe3\x80"), std::string("\x80"), std::string("\xff")}) {
+            jinja::string str(" " + text + " ");
+            str.strip(true, true);
+            t.assert_true("invalid bytes are not trimmed", str.str() == text);
+        }
+    });
     static auto render = [](const std::string & tmpl, const json & vars) -> jinja::string {
         jinja::lexer lexer;
         auto lexer_res = lexer.tokenize(tmpl);
